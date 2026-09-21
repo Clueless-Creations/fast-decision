@@ -1,0 +1,14 @@
+{
+  "name": "fast-decision",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Explicit, bounded Jev judgments through Vercel AI Gateway",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "check": "node --check scripts/decide.mjs && node --check scripts/lib/contract.mjs && node --check scripts/lib/runtime.mjs",
+    "test": "node --test test/contract.test.mjs test/runtime.test.mjs test/cli.test.mjs",
+    "test:coverage": "node --experimental-test-coverage --test test/contract.test.mjs test/runtime.test.mjs test/cli.test.mjs"
+  },
+  "license": "MIT"
+}
