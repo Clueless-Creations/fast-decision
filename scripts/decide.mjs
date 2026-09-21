@@ -1,98 +1,58 @@
 #!/usr/bin/env node
+import { DecisionError, MODEL, MAX_INPUT_BYTES } from "./lib/contract.mjs";
+import { evaluate, preflight, readBounded, resolveCredential, TIMEOUT_MS } from "./lib/runtime.mjs";
 
-import fs from "node:fs";
-import { spawnSync } from "node:child_process";
+const HELP = `Fast decision: bounded Jev judgments via Vercel AI Gateway.
 
-const ENDPOINT = "https://ai-gateway.vercel.sh/v1/evaluate";
-const MODEL = "typesafe-ai/jev";
-const MAX_INPUT_BYTES = 128_000;
-const MAX_OUTPUT_BYTES = 256_000;
-const TIMEOUT_MS = 15_000;
+Usage:
+  node scripts/decide.mjs < request.json              Evaluate (one external call)
+  node scripts/decide.mjs --validate < request.json   Validate locally, no auth/network
+  node scripts/decide.mjs --doctor                    Check local credentials, no network
+  node scripts/decide.mjs --help                      Show this help
 
-function fail(message, code = 1) {
-  process.stderr.write(`${message}\n`);
-  process.exit(code);
-}
+Input: {state, questions, policy?, providerOptions?}
+Questions: choice, boolean, score. Gateway uses boolean, not noul.
+No policy means abstain. Read SKILL.md and docs/contract.md before acting.
+Exit codes: 0 ready/offline success; 1 invalid input/provider/network;
+            2 authentication; 3 valid answers requiring host review.
+JSON results go to stdout; JSON errors go to stderr. Credentials stay local.
+`;
 
-function safeProviderDetail(result) {
-  const error = result && typeof result === "object" ? result.error : undefined;
-  if (typeof error === "string") return error.slice(0, 300).replace(/[\r\n]+/g, " ");
-  if (!error || typeof error !== "object") return "no provider detail";
-  const code = typeof error.code === "string" ? error.code : "";
-  const message = typeof error.message === "string" ? error.message : "";
-  const detail = [code, message].filter(Boolean).join(": ");
-  return (detail || "no provider detail").slice(0, 300).replace(/[\r\n]+/g, " ");
-}
+function emit(value) { process.stdout.write(`${JSON.stringify(value, null, 2)}\n`); }
 
-function keychainToken() {
-  if (process.platform !== "darwin") return "";
-  const account = process.env.USER || process.env.USERNAME || "";
-  const result = spawnSync(
-    "security",
-    ["find-generic-password", "-a", account, "-s", "codex-fast-decision", "-w"],
-    { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-  );
-  return result.status === 0 ? result.stdout.trim() : "";
-}
-
-const token = process.env.AI_GATEWAY_API_KEY || process.env.VERCEL_OIDC_TOKEN || keychainToken();
-if (!token) fail("Fast decision needs AI_GATEWAY_API_KEY, VERCEL_OIDC_TOKEN, or the macOS Keychain item codex-fast-decision.", 2);
-
-const input = fs.readFileSync(0, "utf8");
-if (Buffer.byteLength(input, "utf8") > MAX_INPUT_BYTES) fail("Fast decision input is too large.");
-
-let request;
-try {
-  request = JSON.parse(input);
-} catch {
-  fail("Fast decision input must be one JSON object on stdin.");
-}
-
-if (!request || typeof request !== "object" || Array.isArray(request)) fail("Fast decision input must be a JSON object.");
-if (!("state" in request) || !request.questions || typeof request.questions !== "object" || Array.isArray(request.questions)) {
-  fail("Fast decision input requires state and questions.");
-}
-
-const controller = new AbortController();
-const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-
-try {
-  const response = await fetch(ENDPOINT, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      state: request.state,
-      questions: request.questions,
-      ...(request.providerOptions ? { providerOptions: request.providerOptions } : {}),
-    }),
-    signal: controller.signal,
-  });
-
-  const raw = await response.text();
-  if (Buffer.byteLength(raw, "utf8") > MAX_OUTPUT_BYTES) fail("Fast decision response is too large.");
-
-  let result;
-  try {
-    result = JSON.parse(raw);
-  } catch {
-    fail(`Fast decision provider returned invalid JSON (HTTP ${response.status}).`);
+async function main() {
+  const args = process.argv.slice(2);
+  if (args.length > 1 || (args.length === 1 && !["--help", "-h", "--validate", "--doctor"].includes(args[0]))) {
+    throw new DecisionError("INVALID_ARGUMENT", "Use --help, --validate, --doctor, or no arguments. Supply JSON on stdin.");
   }
-
-  if (!response.ok) fail(`Fast decision provider returned HTTP ${response.status}: ${safeProviderDetail(result)}`);
-  process.stdout.write(JSON.stringify({
-    model: result.model,
-    answers: result.answers,
-    providerMetadata: result.providerMetadata,
-    usage: result.usage,
-    warnings: result.warnings,
-  }, null, 2) + "\n");
-} catch (error) {
-  if (error?.name === "AbortError") fail("Fast decision timed out.");
-  fail("Fast decision request failed.");
-} finally {
-  clearTimeout(timer);
+  if (["--help", "-h"].includes(args[0])) { process.stdout.write(HELP); return; }
+  if (args[0] === "--doctor") {
+    const { source } = resolveCredential();
+    emit({ schemaVersion: "fast-decision/doctor/v1", credentialDetected: true, credentialSource: source,
+      authenticationVerified: false, model: MODEL, node: process.versions.node, network: false });
+    return;
+  }
+  if (process.stdin.isTTY) throw new DecisionError("INPUT_REQUIRED", "Provide one JSON request on stdin. Use --help for examples.");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  let raw;
+  try { raw = await readBounded(process.stdin, MAX_INPUT_BYTES, controller.signal); }
+  finally { clearTimeout(timer); }
+  let request;
+  try { request = JSON.parse(raw); } catch { throw new DecisionError("INVALID_INPUT", "Input must be one JSON object on stdin."); }
+  if (args[0] === "--validate") { emit(preflight(request)); return; }
+  const result = await evaluate(request);
+  emit(result);
+  if (result.status === "abstain") process.exitCode = 3;
 }
+
+// Do not print exception stacks, request data, or upstream error bodies.
+main().catch((error) => {
+  const known = error instanceof DecisionError;
+  process.stderr.write(`${JSON.stringify({ error: {
+    code: known ? error.code : "INTERNAL_ERROR",
+    message: known ? error.message : "Fast decision failed without exposing diagnostic data.",
+    retryable: false, ...(known ? error.details : {}),
+  } })}\n`);
+  process.exitCode = known ? error.exitCode : 1;
+});
